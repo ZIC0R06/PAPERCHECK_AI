@@ -1,0 +1,130 @@
+# ══════════════════════════════════════════════════════════════════
+# IntelliGrade-H — requirements.txt
+# ══════════════════════════════════════════════════════════════════
+# Install everything:   pip install -r requirements.txt
+#
+# Sections:
+#   1. Web API & server
+#   2. Database
+#   3. PDF extraction (typed PDFs — always install)
+#   4. OCR engines     (scanned PDFs — install what you can)
+#   5. AI / LLM
+#   6. Computer Vision
+#   7. NLP & similarity
+#   8. Data & utilities
+#   9. Frontend dashboard
+# ══════════════════════════════════════════════════════════════════
+
+
+# ── 1. Web API & server ───────────────────────────────────────────
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart
+aiofiles
+requests
+httpx
+
+
+# ── 2. Database ───────────────────────────────────────────────────
+sqlalchemy
+pydantic
+email-validator
+openpyxl
+python-dotenv
+
+
+# ── 3. PDF extraction — typed PDFs (always required) ─────────────
+pdfplumber
+pypdf
+python-docx
+pymupdf
+reportlab               # evaluated answer sheets, OMR sheets, result PDFs
+pdf2image
+Pillow
+
+
+# ── 4. OCR engines — scanned / image-only PDFs ───────────────────
+#
+# Install at least ONE of these for scanned PDFs to work.
+# Priority (fastest → most capable):
+#   Tesseract → PaddleOCR → TrOCR
+#
+# The parsers auto-detect which engines are installed at startup
+# and skip any that are missing — no crashes, no unnecessary fallbacks.
+
+# Option A: Tesseract (RECOMMENDED — fastest, ~5s/10 pages)
+#   Linux:   sudo apt install tesseract-ocr
+#   macOS:   brew install tesseract
+#   Windows: https://github.com/UB-Mannheim/tesseract/wiki
+pytesseract
+opencv-python
+
+# Option B: PaddleOCR (better for tables and complex layouts)
+#   Fix for OneDNN crash on Windows: use exactly 2.7.3
+paddleocr==2.7.3
+paddlepaddle
+
+# Option C: TrOCR via HuggingFace (last resort — slow, GPU recommended)
+#   torch and transformers are also required by the LLM evaluator (see §5).
+torch
+torchvision
+transformers
+
+
+# ── 5. AI / LLM ───────────────────────────────────────────────────
+# The AI engine is a LOCAL Ollama server (https://ollama.com) reached over HTTP with `requests`
+# (already listed above). No cloud SDK is needed: groq / anthropic packages were removed.
+# Cloud providers, if you ever enable them in .env, also run over plain HTTPS via `requests`.
+
+
+# ── 6. Computer Vision — diagram detection ────────────────────────
+ultralytics
+numpy
+scipy
+
+
+# ── 7. NLP & semantic similarity ──────────────────────────────────
+sentence-transformers
+scikit-learn
+nltk
+spacy
+pyspellchecker          # used by text_processor.py for OCR spell correction
+# After install, download spaCy model:
+#   python -m spacy download en_core_web_sm
+
+
+# ── 8. Data & utilities ───────────────────────────────────────────
+pandas
+
+
+# ── 9. Frontend dashboard ─────────────────────────────────────────
+streamlit
+
+
+# ══════════════════════════════════════════════════════════════════
+# QUICK INSTALL GUIDES
+# ══════════════════════════════════════════════════════════════════
+#
+# Minimal (typed PDFs only, no OCR):
+#   pip install fastapi uvicorn[standard] python-multipart aiofiles \
+#               requests httpx sqlalchemy pydantic python-dotenv \
+#               pdfplumber pymupdf Pillow \
+#               sentence-transformers scikit-learn nltk pandas streamlit
+#
+# + Tesseract OCR support (recommended):
+#   Linux:   sudo apt install tesseract-ocr poppler-utils
+#   macOS:   brew install tesseract poppler
+#   Windows: https://github.com/UB-Mannheim/tesseract/wiki
+#   pip install pytesseract opencv-python pdf2image
+#
+# + PaddleOCR support (Windows — use exact version to avoid OneDNN crash):
+#   pip install paddlepaddle paddleocr==2.7.3
+#
+# + GPU acceleration (NVIDIA):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#   pip install paddlepaddle-gpu
+#
+# Post-install steps:
+#   python -m spacy download en_core_web_sm
+#   python -m nltk.downloader stopwords punkt
+# ══════════════════════════════════════════════════════════════════
