@@ -121,6 +121,9 @@ def _word_present(word: str, stems: set, raw_words: List[str]) -> float:
                 return 0.9
             if len(c2) == len(compact) and c2[0] == compact[0] and sum(a != b for a, b in zip(c2, compact)) <= 1:
                 return 0.7
+            letters = re.sub(r"^\d+", "", compact)            # "1NF" read as "NF": the digit was lost
+            if len(letters) >= 2 and c2 == letters:
+                return 0.7
     return 0.0
 
 
@@ -299,9 +302,12 @@ Mark it criterion by criterion. Award partial marks where a point is partly corr
 is missing. If the student states something factually wrong, mark that point "incorrect" and add a correction.
 Do not reward length or padding; do reward correct points expressed in different words.
 
+"evidence" must be words COPIED EXACTLY from the STUDENT ANSWER above (not from the model answer, not a description).
+Use "" when the student did not write that point.
+
 Return ONLY JSON:
 {{"rubric_breakdown": [{{"criterion": "...", "max_marks": 2, "awarded": 1.5, "status": "met|partial|missing|incorrect",
-   "evidence": "short quote from the student answer or empty", "reason": "why these marks"}}],
+   "evidence": "<exact words from the student answer>", "reason": "why these marks"}}],
  "corrections": [{{"student_wrote": "...", "correct_version": "...", "explanation": "..."}}],
  "strengths": ["..."], "missing_concepts": ["..."],
  "feedback": "2-4 sentences addressed to the student: what earned marks, what lost marks, how to improve",
@@ -333,6 +339,151 @@ def _evidence_in_answer(evidence: str, student: str) -> bool:
     return sum(1 for w in ev if w in st) / len(ev) >= 0.6
 
 
+_PLACEHOLDER = re.compile(r"\bquote\b|student'?s? answer|exact words|copied|from the (student|answer)|^\W*$|^\s*<.*>\s*$|"
+                          r"^\s*(n/?a|none|null|-+|\.{2,}|…)\s*$", re.I)
+
+
+def _is_placeholder(evidence: str) -> bool:
+    """The model pasted the template / a description instead of quoting the student."""
+    return bool(_PLACEHOLDER.search((evidence or "").strip()))
+
+
+def _locate_evidence(point: str, student: str):
+    """(coverage, best matching sentence) when the student's own words cover this marking point, else None."""
+    if not point.strip() or not student.strip():
+        return None
+    cov, _found, _miss = _point_coverage(point, student)
+    if cov < 0.55:                        # sharing a couple of words is not enough
+        return None
+    pg = _char_ngrams(point)
+    sents = _sentences(student) or [student]
+    best = max(sents, key=lambda x: _cosine(pg, _char_ngrams(x)))
+    return cov, best[:300]
+
+
+def _words(t: str) -> set:
+    return {_stem(w) for w in _content_words(t)}
+
+
+def _consistent(r: Dict, avail: float) -> Dict:
+    """The verdict decides the marks: met = full, missing/incorrect = 0, partial = strictly between."""
+    r = dict(r)
+    st = (r.get("status") or "").lower()
+    frac = (r["awarded"] / r["max_marks"]) if r.get("max_marks") else (1.0 if r.get("awarded") else 0.0)
+    if st == "met":
+        frac = 1.0
+    elif st in ("missing", "incorrect"):
+        frac = 0.0
+    elif st == "partial":
+        frac = frac if 0.0 < frac < 1.0 else 0.5
+    r.update({"max_marks": round(avail, 2), "awarded": round(avail * frac, 2)})
+    return r
+
+
+_NEG = re.compile(r"\b(not|no|never|cannot|can't|isn't|doesn't|don't|without)\b", re.I)
+
+
+def _student_sentences(student: str) -> List[str]:
+    flat = " ".join((student or "").split())             # handwriting lines break mid-sentence
+    return [x.strip() for x in re.split(r"(?<=[.;!?])\s+", flat) if len(x.strip()) > 2] or [flat]
+
+
+def _near_verbatim(point: str, student: str):
+    """The best student sentence when it states this marking point almost word for word (≥85% of the point's key
+    words, very similar wording, same negations) — else None. Used to correct a small model that marks such a
+    point 'missing'."""
+    words = list(dict.fromkeys(_content_words(re.sub(r"^\s*[^:]{1,25}:\s*", "", point) or point)))
+    if len(words) < 3:
+        return None
+    raw = re.findall(r"\S+", student or "")
+    stems = {_stem(w) for w in _content_words(student)}
+    kw = sum(_word_present(w, stems, raw) for w in words) / len(words)
+    if kw < 0.85:
+        return None
+    pg = _char_ngrams(point)
+    best = max(_student_sentences(student), key=lambda x: _cosine(pg, _char_ngrams(x)))
+    if _cosine(pg, _char_ngrams(best)) < 0.75:
+        return None
+    if len(_NEG.findall(best)) != len(_NEG.findall(point)):
+        return None
+    return best[:300]
+
+
+def _dedupe_points(rb: List[Dict]) -> List[Dict]:
+    """A small model sometimes lists the same point twice (once 'partial', once 'missing'): keep the better one."""
+    out: List[Dict] = []
+    for r in rb:
+        rw = _words(r["criterion"])
+        dup = None
+        for i, o in enumerate(out):
+            ow = _words(o["criterion"])
+            if rw and ow and len(rw & ow) / len(rw | ow) >= 0.8:
+                dup = i
+                break
+        if dup is None:
+            out.append(r)
+        else:
+            o = out[dup]
+            fr = (r["awarded"] / r["max_marks"]) if r.get("max_marks") else 0
+            fo = (o["awarded"] / o["max_marks"]) if o.get("max_marks") else 0
+            if fr > fo:
+                out[dup] = r
+    return out
+
+
+def _anchor_to_scheme(rb: List[Dict], criteria: List[Dict], max_marks: float, scheme_given: bool) -> List[Dict]:
+    """
+    Small local models are inconsistent: "met" with half marks, invented 0-mark points, their own point values.
+      * always: the verdict decides the marks of each point, and points worth 0 marks are dropped;
+      * with an official marking scheme: every scheme point keeps the scheme's marks, points the model invented
+        are dropped, and a scheme point the model skipped counts as missing.
+    Without a scheme the model may merge / re-word the key points of the model answer (the prompt allows it).
+    """
+    if not rb:
+        return rb
+    if not (scheme_given and criteria):
+        # Without a scheme the model may merge / re-word points. Points it gave no marks value get the marks that
+        # are left (small models often leave "max_marks" out); a point worth nothing that earned nothing is dropped.
+        given = sum(r.get("max_marks", 0) for r in rb)
+        blank = [r for r in rb if not r.get("max_marks")]
+        left = max_marks - given
+        if blank and left > 0.01:            # when the given values already cover the question, blanks are extras
+            share = left / len(blank)
+            for r in blank:
+                r["max_marks"] = round(share, 2)
+                if r.get("awarded", 0) > r["max_marks"]:
+                    r["awarded"] = r["max_marks"]
+        return [_consistent(r, r["max_marks"]) for r in rb if r.get("max_marks", 0) > 0]
+    scale = max_marks / max(1e-9, sum(float(c["marks"]) for c in criteria))
+    used: set = set()
+    out: List[Dict] = []
+    for i, c in enumerate(criteria):
+        cw = _words(c["criterion"])
+        best, best_sc = None, 0.0
+        for j, r in enumerate(rb):
+            if j in used:
+                continue
+            rw = _words(r["criterion"])
+            sc = len(cw & rw) / max(1, len(cw | rw))
+            if sc > best_sc:
+                best, best_sc = j, sc
+        if (best is None or best_sc < 0.3) and len(rb) == len(criteria) and i not in used:
+            best = i                                  # same number of points: fall back to the order
+        elif best_sc < 0.3:
+            best = None
+        avail = float(c["marks"]) * scale
+        if best is None:
+            out.append({"criterion": c["criterion"][:300], "max_marks": round(avail, 2), "awarded": 0.0,
+                        "status": "missing", "evidence": "",
+                        "reason": "The AI did not assess this point; treated as missing — check it."})
+            continue
+        used.add(best)
+        r = _consistent(rb[best], avail)
+        r["criterion"] = c["criterion"][:300]
+        out.append(r)
+    return out
+
+
 def _grade_ai(client, question: Dict, student: str, max_marks: float, criteria: List[Dict],
               scheme_given: bool) -> Optional[GradeResult]:
     # JSON mode + low temperature: marking must be reproducible. Raises LLMError when Ollama is down/unparseable
@@ -340,6 +491,7 @@ def _grade_ai(client, question: Dict, student: str, max_marks: float, criteria: 
     data = client.generate_json(build_grading_prompt(question, student, max_marks, criteria, scheme_given),
                                 max_tokens=2500, system=GRADER_SYSTEM, temperature=0.0)
     unsupported: List[str] = []
+    weak_evidence: List[str] = []
     rb = []
     for item in data.get("rubric_breakdown") or []:
         if not isinstance(item, dict):
@@ -349,14 +501,49 @@ def _grade_ai(client, question: Dict, student: str, max_marks: float, criteria: 
         mx = max(mx, 0.0)
         aw = max(0.0, min(aw, mx)) if mx else max(0.0, aw)
         if aw > 0 and not _evidence_in_answer(str(item.get("evidence") or ""), student):
-            unsupported.append(str(item.get("criterion") or "")[:80])
-            aw = 0.0                      # no verifiable evidence in the student's answer → no marks
-            item["reason"] = "No supporting evidence found in the student's answer for this point."
-            item["status"] = "missing"
+            # Small models often paste the template ("short quote from the student answer") instead of a quote.
+            # Check the point against the student's own words before taking the marks away.
+            # A specific quote the student never wrote is a hallucination → no marks. Only a template / empty
+            # "evidence" (the model did not quote at all) is checked against the student's own words.
+            found = (_locate_evidence(str(item.get("criterion") or ""), student)
+                     if _is_placeholder(str(item.get("evidence") or "")) else None)
+            if found:
+                cov, sentence = found
+                item["evidence"] = sentence
+                item["reason"] = (str(item.get("reason") or "").strip() + " [Evidence located in the answer by the "
+                                  "system — the AI did not quote it.]").strip()
+                if cov < 0.75:            # only partly supported by the student's words → at most half
+                    aw = min(aw, mx * 0.5) if mx else aw * 0.5
+                    item["status"] = "partial"
+                    weak_evidence.append(str(item.get("criterion") or "")[:80])
+            else:
+                unsupported.append(str(item.get("criterion") or "")[:80])
+                aw = 0.0                  # no verifiable evidence in the student's answer → no marks
+                item["reason"] = "No supporting evidence found in the student's answer for this point."
+                item["status"] = "missing"
         st = str(item.get("status") or ("met" if mx and aw >= mx else "partial" if aw > 0 else "missing")).lower()
         rb.append({"criterion": str(item.get("criterion") or "")[:300], "max_marks": round(mx, 2),
                    "awarded": round(aw, 2), "status": st, "evidence": str(item.get("evidence") or "")[:300],
                    "reason": str(item.get("reason") or "")[:400]})
+    rb = _dedupe_points(rb)
+    upgraded: List[str] = []
+    def _single_point(r):                 # the model's point is ONE key point of the key, not several merged
+        rw = _words(r["criterion"])
+        for c in criteria:
+            cw = _words(c["criterion"])
+            if rw and cw and len(rw & cw) / len(rw | cw) >= 0.6:
+                return not r.get("max_marks") or r["max_marks"] <= float(c["marks"]) * 1.25 + 0.01
+        return False
+
+    for r in rb:                          # the student wrote this point almost word for word → it is met
+        if r["status"] in ("missing", "partial") and _single_point(r):
+            sent = _near_verbatim(r["criterion"], student)
+            if sent:
+                r.update({"status": "met", "awarded": r["max_marks"], "evidence": sent,
+                          "reason": "The answer states this point almost word for word (checked by the system; "
+                                    "the AI had marked it " + r["status"] + ")."})
+                upgraded.append(r["criterion"][:80])
+    rb = _anchor_to_scheme(rb, criteria, max_marks, scheme_given)
     total_avail = sum(r["max_marks"] for r in rb)
     if rb and total_avail > 0 and abs(total_avail - max_marks) > 0.01:     # rescale to the paper's marks
         f = max_marks / total_avail
@@ -375,6 +562,13 @@ def _grade_ai(client, question: Dict, student: str, max_marks: float, criteria: 
     if conf > 1.0:                        # some models answer 85 instead of 0.85
         conf = conf / 100.0
     extra_flags = []
+    if upgraded:
+        extra_flags.append("The AI marked these points missing/partial although the answer states them almost word "
+                           "for word; the system gave the marks — confirm: " + "; ".join(upgraded[:4]))
+    if weak_evidence:
+        conf = min(conf, 0.6)
+        extra_flags.append("The AI gave no usable quote and the answer only partly matches: "
+                           + "; ".join(weak_evidence[:4]) + " — half marks at most, check these points.")
     if unsupported:
         conf = min(conf, 0.5)
         extra_flags.append("AI awarded marks without verifiable evidence in the answer for: "

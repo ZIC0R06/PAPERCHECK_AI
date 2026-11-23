@@ -635,6 +635,36 @@ def _extract_rule_based(raw_text: str) -> dict[int, str]:
 # Public API
 # ─────────────────────────────────────────────────────────
 
+def _norm_text(s: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", (s or "").lower()))
+
+
+def _ground_llm_answers(llm: dict, rule: dict, raw_text: str) -> dict:
+    """
+    Keep an LLM-extracted answer only if it appears word-for-word in the PDF text and is not a shortened copy of
+    the rule-based answer for the same question. Otherwise use the rule-based answer.
+    Catches: invented text ("Full model answer here…"), one answer merged into another, dropped sentences.
+    """
+    raw = _norm_text(raw_text)
+    out: dict = {}
+    for qn in sorted(set(llm) | set(rule)):
+        l, r = (llm.get(qn) or "").strip(), (rule.get(qn) or "").strip()
+        nl, nr = _norm_text(l), _norm_text(r)
+        grounded = bool(nl) and nl in raw
+        shorter_copy = bool(nl) and bool(nr) and nl in nr and len(nr) > len(nl)
+        if l and grounded and not shorter_copy:
+            out[qn] = l
+        elif r:
+            if l:
+                logger.warning("Answer key Q%s: LLM text %s — using the text copied from the PDF",
+                               qn, "was shortened" if grounded else "is not in the PDF")
+            out[qn] = r
+        elif l:
+            logger.warning("Answer key Q%s: LLM text could not be verified against the PDF — check it", qn)
+            out[qn] = l
+    return out
+
+
 def parse_answer_key(pdf_path: str) -> dict[int, str]:
     """
     Parse a teacher's answer key PDF into {question_number: answer_text}.
@@ -680,6 +710,13 @@ def parse_answer_key(pdf_path: str) -> dict[int, str]:
     if not answers:
         logger.warning("LLM returned no answers — using rule-based fallback")
         answers = _extract_rule_based(raw_text)
+    else:
+        # Step 4b — ground the LLM in the PDF text: a model answer must be COPIED from the key, never invented,
+        # merged across questions or cut short (small local models do all three).
+        try:
+            answers = _ground_llm_answers(answers, _extract_rule_based(raw_text), raw_text)
+        except Exception as e:      # grounding must never break the import
+            logger.warning("Answer-key grounding skipped: %s", e)
 
     if not answers:
         logger.error(
